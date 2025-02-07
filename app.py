@@ -1,204 +1,191 @@
 import streamlit as st
 import os
 import lancedb
-import pyarrow as pa
 import pandas as pd
 from openai import OpenAI
 
-# Set your OpenAI API key
-OPENAI_API_KEY = "PUT YOUR KEY HERE"
-client = OpenAI(api_key=OPENAI_API_KEY)
+# Initialize OpenAI client
+client = OpenAI(api_key="ENTER_YOUR_API_KEY")
 
-# Use an absolute path for the LanceDB database folder.
-DB_URI = os.path.join(os.getcwd(), "lancedb_insurance_competition")
-TABLE_NAME = "documents"
+# Connect to LanceDB
+db = lancedb.connect("lancedb_insurance_competition")
+table = db["documents"]
 
-# Check if the database folder exists.
-if not os.path.exists(DB_URI):
-    st.error(f"Database folder not found at {DB_URI}. Please run your notebook to create the database first.")
-    st.stop()
+def get_embedding(text: str):
+    """Get embedding from OpenAI API"""
+    response = client.embeddings.create(model="text-embedding-ada-002", input=text)
+    return response.data[0].embedding
 
-# Connect to the existing LanceDB database.
-db = lancedb.connect(DB_URI)
-
-# Retrieve the table using dictionary-style indexing.
-try:
-    table = db[TABLE_NAME]
-except Exception as e:
-    st.error("Error accessing table. Make sure your notebook has run and created the table.\n"
-             f"Error details: {e}")
-    st.stop()
-
-# ------------------------------
-# RAG Functions (Updated for Multi-Company Queries)
-# ------------------------------
-
-def get_embedding(text: str, model: str = "text-embedding-ada-002"):
-    response = client.embeddings.create(model=model, input=text)
-    embedding = response.data[0].embedding
-    return embedding
-
-def extract_companies_from_query(query):
-    """
-    Extract a list of canonical company identifiers from the query using simple substring matching.
-    
-    The mapping is as follows:
-      - "ALL": ["ALLSTATE"]  (only match "ALLSTATE", not the generic "ALL")
-      - "CHUBB": ["CHUBB"]
-      - "PGR": ["PGR", "PROGRESSIVE"]
-      - "TRV": ["TRV", "TVR", "TRAVELERS", "TRAVELER"]
-    
-    If a variant is found in the query (case-insensitive), the corresponding canonical code is added.
-    """
+def extract_companies(query):
+    """Extract company identifiers from query"""
     query_upper = query.upper()
-    company_variants = {
-        "ALL": ["ALLSTATE"],
+    company_mapping = {
+        "ALL": ["ALL", "ALLSTATE"],
         "CHUBB": ["CHUBB"],
         "PGR": ["PGR", "PROGRESSIVE"],
-        "TRV": ["TRV", "TVR", "TRAVELERS", "TRAVELER"],
+        "TRV": ["TRV", "TRAVELERS", "TRAVELER"]
     }
-    found = set()
-    for canonical, variants in company_variants.items():
-        for variant in variants:
-            if variant in query_upper:
-                found.add(canonical)
-                break
-    return list(found)
+    return list({canonical 
+                for canonical, variants in company_mapping.items() 
+                for variant in variants 
+                if variant in query_upper})
 
-def search_lancedb(query_embedding, query, k=10):
-    """
-    Search the LanceDB table for the top k documents similar to the query embedding.
-    If the query mentions multiple companies, perform a separate search for each and combine the results.
-    """
-    companies = extract_companies_from_query(query)
-    st.write("Extracted companies from query:", companies)
-    
-    if companies and len(companies) > 1:
-        results_list = []
-        for comp in companies:
-            st.write(f"Searching for {comp}...")
-            res = table.search(query_embedding)\
-                       .where(f"company = '{comp}'", prefilter=True)\
-                       .limit(k)\
-                       .to_pandas()
-            st.write(f"Found {len(res)} chunks for {comp}")
-            results_list.append(res)
-        if results_list:
-            results = pd.concat(results_list, ignore_index=True)
-        else:
-            results = pd.DataFrame()
-    elif companies:
-        st.write(f"Searching for {companies[0]}...")
-        results = table.search(query_embedding)\
-                       .where(f"company = '{companies[0]}'", prefilter=True)\
-                       .limit(k)\
-                       .to_pandas()
-        st.write(f"Found {len(results)} chunks for {companies[0]}")
+def search_documents(query_embedding, query, k=10):
+    """Search for relevant documents and return results grouped by company"""
+    # If the query explicitly mentions searching all companies, use all.
+    if any(phrase in query.lower() for phrase in ["all companies", "all carriers", "all insurers"]):
+        companies = ["ALL", "CHUBB", "PGR", "TRV"]
+        st.write("📊 Query type: All companies")
     else:
-        st.write("No company filter applied.")
-        results = table.search(query_embedding).limit(k).to_pandas()
-    return results
+        # Otherwise, try to extract companies from the query.
+        companies = extract_companies(query)
+        if companies:
+            st.write("📊 Query type: Specific companies")
+        else:
+            # If no companies were detected, default to all companies.
+            st.write("📊 No specific company found. Searching across all companies.")
+            companies = ["ALL", "CHUBB", "PGR", "TRV"]
+    
+    st.write("🎯 Companies detected:", ", ".join(companies))
+    
+    # Perform a separate search for each company and collect the results.
+    results = []
+    for company in companies:
+        company_results = table.search(query_embedding)\
+                              .where(f"company = '{company}'", prefilter=True)\
+                              .limit(k)\
+                              .to_pandas()
+        st.write(f"📄 Retrieved {len(company_results)} chunks for {company}")
+        results.append(company_results)
+    
+    # Combine the results into one DataFrame.
+    combined_results = pd.concat(results, ignore_index=True) if results else pd.DataFrame()
+    return combined_results
 
-def generate_answer(query, retrieved_chunks, model="o3-mini"):
-    """
-    Generate an answer using the OpenAI chat completions API with markdown formatting.
-    """
-    context_text = "\n\n".join(retrieved_chunks)
-    prompt = f"""You are an insurance competitive intelligence assistant.
-
-Below is context extracted from financial statements of multiple companies.
-Please answer the following question by addressing each company mentioned in the question separately.
-If context for a company is missing, state that the relevant information is not available.
-
-Format your response in markdown as follows:
-1. Start with a brief one-line summary if comparing multiple companies
-2. For each company mentioned in the query:
-   ## Company Name
-   - Key Finding 1
-   - Key Finding 2
-   - etc.
-3. Use markdown headers (##) for company names
-4. Use bullet points (-) for listing items
-5. Use **bold** for important numbers or metrics
-6. Present numerical data consistently
-7. Use proper markdown line breaks between sections
+def generate_answer(query, results_df, model="o3-mini"):
+    """Generate answer using retrieved context"""
+    # Group context by company and show stats
+    context_chunks = []
+    st.write("\n💡 Context Details:")
+    
+    for company, group in results_df.groupby("company"):
+        # Use all chunks instead of limiting to top 3
+        all_chunks = group["text"].tolist()
+        context_chunks.append(f"### {company}\n" + "\n\n".join(all_chunks))
+        st.write(f"- {company}: Using all {len(all_chunks)} retrieved chunks")
+    
+    context_text = "\n\n".join(context_chunks)
+    
+    prompt = f"""Analyze the provided financial statements and answer the question comprehensively.
 
 Context:
 {context_text}
 
 Question:
 {query}
-"""
+
+Please format your response using these guidelines:
+1. If comparing multiple companies, start with a brief executive summary (2-3 sentences). Use level 2 markdown headers (##) for the executive summary title.
+2. For each company mentioned in the query:
+   - Use a level 2 markdown header (##) for the company name
+   - Present key findings as bullet points
+   - Format numbers as plain text with commas (e.g., "5,246 million")
+   - Bold important numbers using markdown (e.g., **5,246 million**)
+   - Never use LaTeX notation ($$) or mathematical formatting
+   - Spell out percentages in plain text (e.g., "15.7 percent")
+3. For financial figures:
+   - Always include the unit (million, billion)
+   - Use consistent number formatting (e.g., "1,234.5 million")
+   - Separate thousands with commas
+
+Example format:
+## Company Name
+- Net income was **5,246 million** in 2023
+- Revenue increased by **15.7 percent** to **10,234 million**"""
+
     response = client.chat.completions.create(
         model=model,
         messages=[
-            {"role": "system", "content": "You are a helpful assistant specializing in clear, structured analysis. Use markdown formatting for clear presentation."},
+            {"role": "system", "content": "You are a precise financial analyst specializing in the insurance industry. Provide clear analysis using plain text numbers and simple markdown formatting only."},
             {"role": "user", "content": prompt}
-        ],
+        ]
     )
     return response.choices[0].message.content.strip()
 
-def answer_query(query, top_k=10):
-    """
-    Process the query: compute its embedding, search for relevant document chunks
-    (with filtering for each mentioned company), and generate an answer.
-    Returns a tuple (answer, retrieved_chunks).
-    """
-    query_embedding = get_embedding(query)
-    results_df = search_lancedb(query_embedding, query, k=top_k)
-    if results_df.empty:
-        return "No relevant context found for your query.", []
-    retrieved_chunks = results_df["text"].tolist() if "text" in results_df.columns else []
-    answer = generate_answer(query, retrieved_chunks)
-    return answer, retrieved_chunks
+# Custom CSS for better formatting
+st.markdown("""
+    <style>
+    .stMarkdown h2 {
+        padding-top: 1rem;
+        padding-bottom: 0.5rem;
+        color: #1E88E5;
+    }
+    .stMarkdown ul {
+        padding-bottom: 1rem;
+    }
+    .stMarkdown li {
+        padding-bottom: 0.3rem;
+    }
+    .stMarkdown strong {
+        color: #1E88E5;
+    }
+    .stExpander {
+        border: 1px solid #ddd;
+        border-radius: 4px;
+        margin-bottom: 1rem;
+    }
+    </style>
+    """, unsafe_allow_html=True)
 
-# ------------------------------
 # Streamlit UI
-# ------------------------------
+st.title("Insurance Company Analysis")
 
-st.title("Insurance Competitive Intelligence RAG")
-
-# Sidebar: List all example queries as individual buttons
+# Sidebar with example queries
 st.sidebar.header("Example Queries")
 example_queries = [
     "What are the causes driving the largest amount of losses across all carriers?",
     "What are the biggest strategic initiatives for Progressive?",
     "Compare Traveler's strategic initiatives with Chubb's.",
     "What is PGR net income?",
-    "Compare Chubb, PGR, TRV and Allstate's net revenue for 2023",
+    "Compare Chubb, PGR, TRV and Allstate's net income for 2023"
 ]
 
-for q in example_queries:
-    if st.sidebar.button(q):
-        st.session_state.query_text = q
-
-# Main query input (pre-populated if an example was selected)
 if "query_text" not in st.session_state:
     st.session_state.query_text = ""
-user_query = st.text_input(
-    "Enter your query:",
-    value=st.session_state.query_text,
-    placeholder="e.g., What are the causes driving the largest amount of losses across all carriers?"
-)
 
-# Submit button and response handling
-if st.button("Submit Query"):
-    with st.spinner("Processing query..."):
-        try:
-            answer, retrieved_chunks = answer_query(user_query, top_k=10)
+for ex_query in example_queries:
+    if st.sidebar.button(ex_query):
+        st.session_state.query_text = ex_query
+
+query = st.text_input("Enter your question:", 
+                     value=st.session_state.query_text,
+                     placeholder="e.g., What are Progressive's strategic initiatives?")
+
+if st.button("Search"):
+    st.markdown("### Query Processing Details")
+    
+    with st.spinner("Processing..."):
+        # Get the query embedding and search for documents.
+        query_embedding = get_embedding(query)
+        results = search_documents(query_embedding, query)
+        
+        if results.empty:
+            st.warning("No relevant information found.")
+        else:
             st.markdown("### Answer")
-            
-            # Display the markdown-formatted answer
+            answer = generate_answer(query, results)
             st.markdown(answer)
             
-            # Show retrieved chunks in a clean format
-            if retrieved_chunks:
-                with st.expander("Retrieved Context Chunks"):
-                    for idx, chunk in enumerate(retrieved_chunks, 1):
-                        preview = chunk[:200] + ("..." if len(chunk) > 200 else "")
-                        st.markdown(f"#### Chunk {idx}")
-                        st.markdown(preview)
+            # Display chunk details (metadata only)
+            st.markdown("### Retrieved Chunk Metadata by Company")
+            for company, group in results.groupby("company"):
+                with st.expander(f"{company} - {len(group)} chunks"):
+                    for idx, (_, row) in enumerate(group.iterrows(), 1):
+                        st.markdown(f"**Chunk {idx} (ID: {row['id']})**")
+                        st.markdown(f"*Source:* {row['source']}")
+                        if '_distance' in row:
+                            st.markdown(f"*Relevancy Score:* {row['_distance']:.4f}")
+                        # Show only the first 5 lines of the chunk text
+                        chunk_preview = "\n".join(row['text'].splitlines()[:5])
+                        st.markdown(f"*Preview:* {chunk_preview}")
                         st.divider()
-                        
-        except Exception as e:
-            st.error(f"Error processing query: {str(e)}")

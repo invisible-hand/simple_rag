@@ -8,14 +8,14 @@ This project implements a RAG system that allows users to query information from
 
 ## Files
 
-- `rag.ipynb`: Jupyter notebook for data processing and database creation
-- `app.py`: Streamlit web application for querying the data
-- `.env`: Environment variables configuration (API keys)
-- `/data`: Directory containing PDF files of financial statements
-  - `all.pdf`: Allstate's 10-K
-  - `chubb.pdf`: Chubb's 10-K
-  - `pgr.pdf`: Progressive's 10-K
-  - `trv.pdf`: Travelers' 10-K
+- `zesty-rag.ipynb`: Jupyter notebook for data processing and database creationwith simple word-based chunking
+- `zesty-rag-langchain_chunking.ipynb`: Jupyter notebook with lancghain chunking
+- `zesty-minimal.ipynb`: Jupyter notebook with minimal necessary code to run streamlit app
+- `app.py`: Streamlit web application with UI for querying the data
+- `all.pdf`: Allstate's 10-K
+- `chubb.pdf`: Chubb's 10-K
+- `pgr.pdf`: Progressive's 10-K
+- `trv.pdf`: Travelers' 10-K
 
 ## Setup
 
@@ -43,13 +43,6 @@ streamlit run app.py
 3. Click "Submit Query" to get results
 4. Use example queries from the sidebar for reference
 
-Example queries:
-- "What are the causes driving the largest amount of losses across all carriers?"
-- "What are the biggest strategic initiatives for Progressive?"
-- "Compare Traveler's strategic initiatives with Chubb's."
-- "What is PGR net income?"
-- "Compare Chubb, PGR, TRV and Allstate's net revenue for 2023"
-
 ## Data Sources
 
 Financial statements can be obtained from SEC.gov:
@@ -58,16 +51,6 @@ Financial statements can be obtained from SEC.gov:
 3. View as HTML
 4. Print to PDF
 5. Save with the appropriate filename (all.pdf, chubb.pdf, pgr.pdf, or trv.pdf)
-
-## Requirements
-txt
-streamlit
-openai
-lancedb
-PyPDF2
-pandas
-pyarrow
-python-dotenv
 
 ## License
 
